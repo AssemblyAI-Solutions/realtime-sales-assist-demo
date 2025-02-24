@@ -14,15 +14,18 @@ function App() {
   const currentChunkIndex = useRef(0);
   const audioChunks = useRef([]);
   const processingTimeoutRef = useRef(null);
+  const currentSpeakerRef = useRef('none');
   
   // Recording states
   const [isRecording, setIsRecording] = useState(false);
+  const [isTranscriptionStopped, setIsTranscriptionStopped] = useState(true);
   const [transcript, setTranscript] = useState('');
   const [currentAccumulatingTranscript, setCurrentAccumulatingTranscript] = useState('');
   const [inputMode, setInputMode] = useState('microphone');
   const [audioFile, setAudioFile] = useState(null);
   const [isLLMProcessing, setIsLLMProcessing] = useState(false);
   const [callContext, setCallContext] = useState('');
+  const [currentSpeaker, setCurrentSpeaker] = useState('none');
   
   // Sales assistant states
   const [conversationId] = useState(() => `conv_${Date.now()}`);
@@ -37,13 +40,33 @@ function App() {
   const [salesReminders, setSalesReminders] = useState([]);
   const [objections, setObjections] = useState([]);
 
+  useEffect(() => {
+    currentSpeakerRef.current = currentSpeaker;
+  }, [currentSpeaker]);
+
   const handleContextChange = (e) => {
     setCallContext(e.target.value);
+  };
+
+  const handleSpeakerChange = async (newSpeaker) => {
+    if (realtimeTranscriber.current && currentSpeaker !== newSpeaker) {
+      try {
+        realtimeTranscriber.current.websocket.send(JSON.stringify({
+          "force_end_utterance": true
+        }));
+        
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        console.error('Error forcing utterance end:', error);
+      }
+    }
+    setCurrentSpeaker(newSpeaker);
   };
 
   const cleanupResources = async (previousMode) => {
     try {
       setIsRecording(false);
+      setIsTranscriptionStopped(true);
       setTranscript('');
       setCurrentAccumulatingTranscript('');
   
@@ -116,11 +139,13 @@ function App() {
     }
 
     processingTimeoutRef.current = setTimeout(() => {
-      if (currentAccumulatingTranscript.trim() && !isLLMProcessing) {
+      if (!isTranscriptionStopped && currentAccumulatingTranscript.trim() && !isLLMProcessing) {
         processTranscriptUpdate(currentAccumulatingTranscript);
       }
-    }, 10000);
-  }, [currentAccumulatingTranscript, isLLMProcessing]);
+    }, 5000);
+  }, [currentAccumulatingTranscript, isLLMProcessing, isTranscriptionStopped]);
+
+  const lastProcessedIndex = useRef(0);
 
   const setupTranscriber = async () => {
     if (!realtimeTranscriber.current) {
@@ -130,18 +155,64 @@ function App() {
       });
 
       const texts = {};
+      let lastSpeaker = null;
+      
       realtimeTranscriber.current.on('transcript', transcript => {
-        let msg = '';
-        texts[transcript.audio_start] = transcript.text;
+        let displayMsg = '';  // For UI
+        let newMsg = '';     // For new LLM content only
+        
+        // Only add non-empty text
+        if (transcript.text.trim()) {
+          texts[transcript.audio_start] = {
+            text: transcript.text.trim(),
+            speaker: currentSpeakerRef.current,
+            index: Object.keys(texts).length
+          };
+        }
+        
         const keys = Object.keys(texts);
         keys.sort((a, b) => a - b);
+        
+        // Build messages
+        let isFirst = true;
         for (const key of keys) {
-          if (texts[key]) {
-            msg += ` ${texts[key]}`;
+          if (texts[key] && texts[key].text.trim()) {
+            const { text, speaker, index } = texts[key];
+            
+            // Build display message (full transcript for UI)
+            if (speaker !== lastSpeaker && !isFirst) {
+              displayMsg += '\n';
+            }
+            if (isFirst || speaker !== lastSpeaker) {
+              displayMsg += speaker === 'none' 
+                ? ` ${text}`
+                : ` <strong>${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}:</strong> ${text}`;
+            } else {
+              displayMsg += ` ${text}`;
+            }
+            
+            // Only add to new message if it's new content and non-empty
+            if (index > lastProcessedIndex.current && 
+                transcript.message_type === 'FinalTranscript' && 
+                text.trim()) {
+              // Only add speaker label if it's a new speaker or first message
+              const speakerPrefix = speaker === 'none' ? '' : 
+                `${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}: `;
+              newMsg = speakerPrefix + text;  // Replace instead of append
+              lastProcessedIndex.current = index;
+            }
+            
+            lastSpeaker = speaker;
+            isFirst = false;
           }
         }
-        setTranscript(msg);
-        setCurrentAccumulatingTranscript(prev => prev + ' ' + transcript.text);
+        
+        setTranscript(displayMsg);
+        
+        // Only update accumulating transcript if we have new content
+        if (newMsg.trim()) {
+          setCurrentAccumulatingTranscript(newMsg);
+        }
       });
 
       realtimeTranscriber.current.on('error', event => {
@@ -159,73 +230,79 @@ function App() {
     }
   };
 
-  const processTranscriptUpdate = useCallback(async (newTranscript) => {
-    if (!newTranscript.trim()) return;
+  // Modify the processTranscriptUpdate function to clear the current transcript before processing
+const processTranscriptUpdate = useCallback(async (newTranscript) => {
+  if (!newTranscript.trim()) return;
+  
+  // Store the current transcript and clear it immediately to prevent duplicate processing
+  const transcriptToProcess = newTranscript;
+  setCurrentAccumulatingTranscript('');
+  const labeledTranscript = transcriptToProcess
+  
+  setIsLLMProcessing(true);
+  try {
+    const response = await fetch('http://localhost:8000/process-transcript', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        transcript: labeledTranscript,
+        conversationId,
+        callContext
+      })
+    });
+
+    const updates = await response.json();
     
-    setIsLLMProcessing(true);
-    try {
-      const response = await fetch('http://localhost:8000/process-transcript', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          transcript: newTranscript,
-          conversationId,
-          callContext
-        })
-      });
-
-      const updates = await response.json();
+    if (updates.update_summary) {
+      setSummaryPoints(prev => [...prev, updates.update_summary.new_point]);
+    }
+    if (updates.update_bant) {
+      setBANT(prev => ({
+        ...prev,
+        ...updates.update_bant
+      }));
+    }
+    if (updates.update_company_info) {
+      setCompanyInfo(updates.update_company_info.companyInfo);
+    }
+    if (updates.update_sales_reminders) {
+      setSalesReminders(prev => [...prev, updates.update_sales_reminders.new_reminder]);
+    }
+    if (updates.update_objections && updates.update_objections.new_objection) {
+      let objectionText;
+      if (typeof updates.update_objections.new_objection === 'string') {
+        // Extract the objection text from the parameter tag
+        const match = updates.update_objections.new_objection.match(/<parameter name="objection">(.*)/);
+        objectionText = match ? match[1] : updates.update_objections.new_objection;
+      } else {
+        objectionText = updates.update_objections.new_objection.objection;
+      }
+    
+      const newObjection = {
+        objection: objectionText,
+        handling_strategy: updates.update_objections.handling_strategy
+      };
       
-      if (updates.update_summary) {
-        setSummaryPoints(prev => [...prev, updates.update_summary.new_point]);
-      }
-      if (updates.update_bant) {
-        setBANT(updates.update_bant);
-      }
-      if (updates.update_company_info) {
-        setCompanyInfo(updates.update_company_info.companyInfo);
-      }
-      if (updates.update_sales_reminders) {
-        setSalesReminders(prev => [...prev, updates.update_sales_reminders.new_reminder]);
-      }
-      if (updates.update_objections) {
-        setObjections(prev => [...prev, updates.update_objections.new_objection]);
-      }
-
-      setCurrentAccumulatingTranscript('');
-      startProcessingTimer();
-    } catch (error) {
-      console.error('Error processing transcript:', error);
-    } finally {
-      setIsLLMProcessing(false);
-    }
-  }, [conversationId, callContext, startProcessingTimer]);
-
-  useEffect(() => {
-    if (isRecording) {
-      startProcessingTimer();
-    } else {
-      if (processingTimeoutRef.current) {
-        clearTimeout(processingTimeoutRef.current);
-      }
+      setObjections(prev => [...prev, newObjection]);
     }
 
-    return () => {
-      if (processingTimeoutRef.current) {
-        clearTimeout(processingTimeoutRef.current);
-      }
-    };
-  }, [isRecording, startProcessingTimer]);
+    startProcessingTimer();
+  } catch (error) {
+    console.error('Error processing transcript:', error);
+  } finally {
+    setIsLLMProcessing(false);
+  }
+}, [conversationId, callContext, startProcessingTimer, currentSpeaker]);
 
   useEffect(() => {
-    if (!isLLMProcessing && currentAccumulatingTranscript.trim()) {
+    if (!isTranscriptionStopped && !isLLMProcessing && currentAccumulatingTranscript.trim()) {
       processTranscriptUpdate(currentAccumulatingTranscript);
     }
-  }, [isLLMProcessing, currentAccumulatingTranscript, processTranscriptUpdate]);
+  }, [isLLMProcessing, currentAccumulatingTranscript, processTranscriptUpdate, isTranscriptionStopped]);
 
-  const handleFileUpload = (event) => {
+const handleFileUpload = (event) => {
     const file = event.target.files[0];
     setAudioFile(file);
     if (audioPlayer.current) {
@@ -291,6 +368,8 @@ function App() {
 
   const startTranscription = async () => {
     await setupTranscriber();
+    setIsTranscriptionStopped(false);
+    setIsRecording(true);
 
     if (inputMode === 'microphone') {
       navigator.mediaDevices.getUserMedia({ audio: true })
@@ -321,14 +400,12 @@ function App() {
       
       audioPlayer.current.play();
     }
-
-    setIsRecording(true);
   };
 
   const pauseTranscription = async (event) => {
     event.preventDefault();
     setIsRecording(false);
-  
+    
     if (inputMode === 'microphone' && recorder.current) {
       recorder.current.pauseRecording();
     } else {
@@ -354,6 +431,9 @@ function App() {
   };
 
   const stopTranscription = async () => {
+    setIsTranscriptionStopped(true);
+    setIsRecording(false);
+
     if (realtimeTranscriber.current) {
       await realtimeTranscriber.current.close();
       realtimeTranscriber.current = null;
@@ -379,11 +459,9 @@ function App() {
 
     audioChunks.current = [];
     currentChunkIndex.current = 0;
-    setIsRecording(false);
     setTranscript('');
     setCurrentAccumulatingTranscript('');
   };
-
   return (
     <div className="App">
       <header>
@@ -460,14 +538,53 @@ function App() {
             )}
           </div>
         )}
+
+        <div className="speaker-labels">
+          <h4>Speaker Label</h4>
+          <div className="speaker-buttons">
+            <label className={`speaker-button ${currentSpeaker === 'none' ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name="speaker"
+                value="none"
+                checked={currentSpeaker === 'none'}
+                onChange={() => handleSpeakerChange('none')}
+              />
+              No Label
+            </label>
+            <label className={`speaker-button ${currentSpeaker === 'sales_rep' ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name="speaker"
+                value="sales_rep"
+                checked={currentSpeaker === 'sales_rep'}
+                onChange={() => handleSpeakerChange('sales_rep')}
+              />
+              Sales Rep
+            </label>
+            <label className={`speaker-button ${currentSpeaker === 'customer' ? 'active' : ''}`}>
+              <input
+                type="radio"
+                name="speaker"
+                value="customer"
+                checked={currentSpeaker === 'customer'}
+                onChange={() => handleSpeakerChange('customer')}
+              />
+              Customer
+            </label>
+          </div>
+        </div>
       </div>
 
       <div className="dashboard-container">
         <div className="dashboard-panel transcript-panel">
           <h3>Live Transcript</h3>
-          <div className="transcript-content">
-            {transcript || 'Waiting for speech...'}
-          </div>
+          <div 
+            className="transcript-content"
+            dangerouslySetInnerHTML={{ 
+              __html: transcript || 'Waiting for speech...'
+            }}
+          />
         </div>
 
         <div className="dashboard-panel summary-panel">

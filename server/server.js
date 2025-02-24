@@ -18,6 +18,10 @@ const conversations = new Map();
 
 const getSystemPrompt = (callContext) => `You are an expert sales analyst monitoring an ongoing sales conversation in real-time. 
     Your role is to provide valuable insights to the sales representative by analyzing the conversation as it unfolds. 
+    Only make updates that help the sales rep. The insights you are providing should be regarding the customer.
+
+    The conversation may or may not be labeled with speakers (Sales Rep: or Customer:) to help you understand who is speaking.
+    If the conversations is not labeled, do your best to infer who is speaking.
     You should focus on identifying key information about the prospect, their needs, and potential opportunities while 
     maintaining an organized understanding of the conversation's progress.
     ${callContext ? `\nAdditional context for this specific call: ${callContext}` : ''}`;
@@ -65,13 +69,13 @@ const TOOLS = [
   },
   {
     name: "update_company_info",
-    description: "Update information about the prospect's company when new details are discovered",
+    description: "Update information about the prospect's or customer's company when new details are discovered. Don't include information on the sales reps company.",
     input_schema: {
       type: "object",
       properties: {
         companyInfo: {
           type: "string",
-          description: "Key information about the prospect's company"
+          description: "Key information about the prospect's company. Don't include information on the sales reps company."
         }
       },
       required: ["companyInfo"]
@@ -213,7 +217,7 @@ app.post('/process-transcript', async (req, res) => {
     console.log('User Message:', JSON.stringify(userMessage, null, 2));
 
     let message = await anthropic.messages.create({
-      model: "claude-3-5-haiku-latest",
+      model: "claude-3-7-sonnet-latest",
       max_tokens: 1024,
       system: getSystemPrompt(callContext),
       tools: TOOLS,
@@ -264,7 +268,7 @@ app.post('/process-transcript', async (req, res) => {
       
       // Get next message from Claude
       message = await anthropic.messages.create({
-        model: "claude-3-5-haiku-latest",
+        model: "claude-3-7-sonnet-latest",
         max_tokens: 1024,
         system: getSystemPrompt(callContext),
         tools: TOOLS,
