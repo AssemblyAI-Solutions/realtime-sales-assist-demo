@@ -123,38 +123,40 @@ function App() {
   }, [currentAccumulatingTranscript, isLLMProcessing]);
 
   const setupTranscriber = async () => {
-    realtimeTranscriber.current = new RealtimeTranscriber({
-      token: await getToken(),
-      sampleRate: 16_000,
-    });
+    if (!realtimeTranscriber.current) {
+      realtimeTranscriber.current = new RealtimeTranscriber({
+        token: await getToken(),
+        sampleRate: 16_000,
+      });
 
-    const texts = {};
-    realtimeTranscriber.current.on('transcript', transcript => {
-      let msg = '';
-      texts[transcript.audio_start] = transcript.text;
-      const keys = Object.keys(texts);
-      keys.sort((a, b) => a - b);
-      for (const key of keys) {
-        if (texts[key]) {
-          msg += ` ${texts[key]}`;
+      const texts = {};
+      realtimeTranscriber.current.on('transcript', transcript => {
+        let msg = '';
+        texts[transcript.audio_start] = transcript.text;
+        const keys = Object.keys(texts);
+        keys.sort((a, b) => a - b);
+        for (const key of keys) {
+          if (texts[key]) {
+            msg += ` ${texts[key]}`;
+          }
         }
-      }
-      setTranscript(msg);
-      setCurrentAccumulatingTranscript(prev => prev + ' ' + transcript.text);
-    });
+        setTranscript(msg);
+        setCurrentAccumulatingTranscript(prev => prev + ' ' + transcript.text);
+      });
 
-    realtimeTranscriber.current.on('error', event => {
-      console.error(event);
-      realtimeTranscriber.current.close();
-      realtimeTranscriber.current = null;
-    });
+      realtimeTranscriber.current.on('error', event => {
+        console.error(event);
+        realtimeTranscriber.current.close();
+        realtimeTranscriber.current = null;
+      });
 
-    realtimeTranscriber.current.on('close', (code, reason) => {
-      console.log(`Connection closed: ${code} ${reason}`);
-      realtimeTranscriber.current = null;
-    });
+      realtimeTranscriber.current.on('close', (code, reason) => {
+        console.log(`Connection closed: ${code} ${reason}`);
+        realtimeTranscriber.current = null;
+      });
 
-    await realtimeTranscriber.current.connect();
+      await realtimeTranscriber.current.connect();
+    }
   };
 
   const processTranscriptUpdate = useCallback(async (newTranscript) => {
@@ -237,6 +239,7 @@ function App() {
         clearInterval(processingInterval.current);
         processingInterval.current = null;
       }
+      setIsRecording(false);
     } else {
       const currentTime = audioPlayer.current.currentTime;
       currentChunkIndex.current = Math.floor(currentTime * 10);
@@ -252,6 +255,7 @@ function App() {
           processingInterval.current = null;
         }
       }, 100);
+      setIsRecording(true);
     }
   };
 
@@ -321,18 +325,12 @@ function App() {
     setIsRecording(true);
   };
 
-  const endTranscription = async (event) => {
+  const pauseTranscription = async (event) => {
     event.preventDefault();
     setIsRecording(false);
-
-    if (realtimeTranscriber.current) {
-      await realtimeTranscriber.current.close();
-      realtimeTranscriber.current = null;
-    }
-
+  
     if (inputMode === 'microphone' && recorder.current) {
       recorder.current.pauseRecording();
-      recorder.current = null;
     } else {
       if (processingInterval.current) {
         clearInterval(processingInterval.current);
@@ -340,20 +338,50 @@ function App() {
       }
       
       if (audioPlayer.current) {
-        audioPlayer.current.removeEventListener('play', handleAudioPlaybackChange);
-        audioPlayer.current.removeEventListener('pause', handleAudioPlaybackChange);
         audioPlayer.current.pause();
-        audioPlayer.current.currentTime = 0;
       }
-      
-      audioChunks.current = [];
-      currentChunkIndex.current = 0;
+    }
+  };
+
+  const resumeTranscription = async () => {
+    setIsRecording(true);
+    
+    if (inputMode === 'microphone' && recorder.current) {
+      recorder.current.resumeRecording();
+    } else if (audioPlayer.current) {
+      audioPlayer.current.play();
+    }
+  };
+
+  const stopTranscription = async () => {
+    if (realtimeTranscriber.current) {
+      await realtimeTranscriber.current.close();
+      realtimeTranscriber.current = null;
+    }
+
+    if (inputMode === 'microphone' && recorder.current) {
+      recorder.current.stopRecording();
+      recorder.current = null;
+    }
+
+    if (audioPlayer.current) {
+      audioPlayer.current.removeEventListener('play', handleAudioPlaybackChange);
+      audioPlayer.current.removeEventListener('pause', handleAudioPlaybackChange);
+      audioPlayer.current.pause();
+      audioPlayer.current.src = '';
+      audioPlayer.current.currentTime = 0;
     }
 
     if (audioContext.current) {
       await audioContext.current.close();
       audioContext.current = null;
     }
+
+    audioChunks.current = [];
+    currentChunkIndex.current = 0;
+    setIsRecording(false);
+    setTranscript('');
+    setCurrentAccumulatingTranscript('');
   };
 
   return (
@@ -407,17 +435,30 @@ function App() {
         </p>
         
         {isRecording ? (
-          <button className="real-time-interface__button" onClick={endTranscription}>
-            {inputMode === 'microphone' ? 'Stop recording' : 'Stop playing'}
+          <button className="real-time-interface__button" onClick={pauseTranscription}>
+            {inputMode === 'microphone' ? 'Pause recording' : 'Pause playing'}
           </button>
         ) : (
-          <button 
-            className="real-time-interface__button" 
-            onClick={startTranscription}
-            disabled={inputMode === 'file' && !audioFile}
-          >
-            {inputMode === 'microphone' ? 'Record' : 'Play'}
-          </button>
+          <div className="button-group">
+            <button 
+              className="real-time-interface__button" 
+              onClick={realtimeTranscriber.current ? resumeTranscription : startTranscription}
+              disabled={inputMode === 'file' && !audioFile}
+            >
+              {realtimeTranscriber.current 
+                ? (inputMode === 'microphone' ? 'Resume recording' : 'Resume playing')
+                : (inputMode === 'microphone' ? 'Start recording' : 'Start playing')
+              }
+            </button>
+            {realtimeTranscriber.current && (
+              <button 
+                className="real-time-interface__button real-time-interface__button--stop" 
+                onClick={stopTranscription}
+              >
+                Stop completely
+              </button>
+            )}
+          </div>
         )}
       </div>
 

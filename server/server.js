@@ -45,7 +45,7 @@ const TOOLS = [
       properties: {
         budget: {
           type: "string",
-          description: "Identified budget information or 'Not identified'"
+          description: "Identified budget information (anything related to the customers finances) or 'Not identified'"
         },
         authority: {
           type: "string",
