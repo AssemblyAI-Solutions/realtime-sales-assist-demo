@@ -167,6 +167,8 @@ audio {
   padding: 10px;
   background: #f8f9fa;
   border-radius: 4px;
+  white-space: pre-wrap;
+  text-align: left;
 }
 
 /* BANT Panel */
