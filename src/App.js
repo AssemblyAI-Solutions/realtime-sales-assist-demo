@@ -15,6 +15,7 @@ function App() {
   const audioChunks = useRef([]);
   const processingTimeoutRef = useRef(null);
   const currentSpeakerRef = useRef('none');
+  const lastProcessedIndex = useRef(0);
   
   // Recording states
   const [isRecording, setIsRecording] = useState(false);
@@ -61,6 +62,181 @@ function App() {
       }
     }
     setCurrentSpeaker(newSpeaker);
+  };
+
+  const processTranscriptUpdate = useCallback(async (newTranscript) => {
+    if (!newTranscript.trim()) {
+      if (!isTranscriptionStopped) {
+        if (processingTimeoutRef.current) {
+          clearTimeout(processingTimeoutRef.current);
+        }
+        processingTimeoutRef.current = setTimeout(() => {
+          if (!isTranscriptionStopped && currentAccumulatingTranscript.trim()) {
+            processTranscriptUpdate(currentAccumulatingTranscript);
+          }
+        }, 5000);
+      }
+      return;
+    }
+    
+    const transcriptToProcess = newTranscript;
+    setCurrentAccumulatingTranscript('');
+    const labeledTranscript = transcriptToProcess;
+    
+    setIsLLMProcessing(true);
+    try {
+      const response = await fetch('http://localhost:8000/process-transcript', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          transcript: labeledTranscript,
+          conversationId,
+          callContext
+        })
+      });
+
+      const updates = await response.json();
+      
+      if (updates.update_summary) {
+        setSummaryPoints(prev => [...prev, updates.update_summary.new_point]);
+      }
+      if (updates.update_bant) {
+        setBANT(prev => ({
+          ...prev,
+          ...updates.update_bant
+        }));
+      }
+      if (updates.update_company_info) {
+        setCompanyInfo(updates.update_company_info.companyInfo);
+      }
+      if (updates.update_sales_reminders) {
+        setSalesReminders(prev => [...prev, updates.update_sales_reminders.new_reminder]);
+      }
+      // In processTranscriptUpdate, replace the objections handling code with this:
+      if (updates.update_objections && updates.update_objections.new_objection) {
+        let newObjection;
+        if (typeof updates.update_objections.new_objection === 'string') {
+          // Handle string case (though this shouldn't happen with new format)
+          const match = updates.update_objections.new_objection.match(/<parameter name="objection">(.*)/);
+          newObjection = {
+            objection: match ? match[1] : updates.update_objections.new_objection,
+            handling_strategy: updates.update_objections.handling_strategy || 'No strategy provided'
+          };
+        } else {
+          // Handle object case (the new format)
+          newObjection = {
+            objection: updates.update_objections.new_objection.objection,
+            handling_strategy: updates.update_objections.new_objection.handling_strategy
+          };
+        }
+        
+        setObjections(prev => [...prev, newObjection]);
+      }
+
+      if (!isTranscriptionStopped) {
+        if (processingTimeoutRef.current) {
+          clearTimeout(processingTimeoutRef.current);
+        }
+        processingTimeoutRef.current = setTimeout(() => {
+          if (!isTranscriptionStopped && currentAccumulatingTranscript.trim()) {
+            processTranscriptUpdate(currentAccumulatingTranscript);
+          }
+        }, 5000);
+      }
+    } catch (error) {
+      console.error('Error processing transcript:', error);
+    } finally {
+      setIsLLMProcessing(false);
+    }
+  }, [conversationId, callContext, currentAccumulatingTranscript, isTranscriptionStopped]);
+
+  useEffect(() => {
+    if (!isTranscriptionStopped && !isLLMProcessing) {
+      processTranscriptUpdate(currentAccumulatingTranscript);
+    }
+  }, [isLLMProcessing, currentAccumulatingTranscript, processTranscriptUpdate, isTranscriptionStopped]);
+
+  const setupTranscriber = async () => {
+    if (!realtimeTranscriber.current) {
+      realtimeTranscriber.current = new RealtimeTranscriber({
+        token: await getToken(),
+        sampleRate: 16_000,
+      });
+
+      const texts = {};
+      let lastSpeaker = null;
+      
+      realtimeTranscriber.current.on('transcript', transcript => {
+        let displayMsg = '';  // For UI
+        let newMsg = '';     // For new LLM content only
+        
+        // Only add non-empty text
+        if (transcript.text.trim()) {
+          texts[transcript.audio_start] = {
+            text: transcript.text.trim(),
+            speaker: currentSpeakerRef.current,
+            index: Object.keys(texts).length,
+            isFinal: transcript.message_type === 'FinalTranscript'
+          };
+        }
+        
+        const keys = Object.keys(texts);
+        keys.sort((a, b) => a - b);
+        
+        // Build messages
+        let isFirst = true;
+        for (const key of keys) {
+          if (texts[key] && texts[key].text.trim()) {
+            const { text, speaker, index, isFinal } = texts[key];
+            
+            // Build display message (full transcript for UI)
+            if (speaker !== lastSpeaker && !isFirst) {
+              displayMsg += '\n';
+            }
+            if (isFirst || speaker !== lastSpeaker) {
+              displayMsg += speaker === 'none' 
+                ? ` ${text}`
+                : ` <strong>${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}:</strong> ${text}`;
+            } else {
+              displayMsg += ` ${text}`;
+            }
+            
+            // Only add to new message if it's final transcript and new content
+            if (isFinal && index > lastProcessedIndex.current && text.trim()) {
+              const speakerPrefix = speaker === 'none' ? '' : 
+                `${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}: `;
+              newMsg = speakerPrefix + text;
+              lastProcessedIndex.current = index;
+            }
+            
+            lastSpeaker = speaker;
+            isFirst = false;
+          }
+        }
+        
+        setTranscript(displayMsg);
+        
+        // Only update accumulating transcript if we have new final content
+        if (newMsg.trim() && transcript.message_type === 'FinalTranscript') {
+          setCurrentAccumulatingTranscript(newMsg);
+        }
+      });
+
+      realtimeTranscriber.current.on('error', event => {
+        console.error(event);
+        realtimeTranscriber.current.close();
+        realtimeTranscriber.current = null;
+      });
+
+      realtimeTranscriber.current.on('close', (code, reason) => {
+        console.log(`Connection closed: ${code} ${reason}`);
+        realtimeTranscriber.current = null;
+      });
+
+      await realtimeTranscriber.current.connect();
+    }
   };
 
   const cleanupResources = async (previousMode) => {
@@ -133,176 +309,7 @@ function App() {
     return data.token;
   };
 
-  const startProcessingTimer = useCallback(() => {
-    if (processingTimeoutRef.current) {
-      clearTimeout(processingTimeoutRef.current);
-    }
-
-    processingTimeoutRef.current = setTimeout(() => {
-      if (!isTranscriptionStopped && currentAccumulatingTranscript.trim() && !isLLMProcessing) {
-        processTranscriptUpdate(currentAccumulatingTranscript);
-      }
-    }, 5000);
-  }, [currentAccumulatingTranscript, isLLMProcessing, isTranscriptionStopped]);
-
-  const lastProcessedIndex = useRef(0);
-
-  const setupTranscriber = async () => {
-    if (!realtimeTranscriber.current) {
-      realtimeTranscriber.current = new RealtimeTranscriber({
-        token: await getToken(),
-        sampleRate: 16_000,
-      });
-
-      const texts = {};
-      let lastSpeaker = null;
-      
-      realtimeTranscriber.current.on('transcript', transcript => {
-        let displayMsg = '';  // For UI
-        let newMsg = '';     // For new LLM content only
-        
-        // Only add non-empty text
-        if (transcript.text.trim()) {
-          texts[transcript.audio_start] = {
-            text: transcript.text.trim(),
-            speaker: currentSpeakerRef.current,
-            index: Object.keys(texts).length
-          };
-        }
-        
-        const keys = Object.keys(texts);
-        keys.sort((a, b) => a - b);
-        
-        // Build messages
-        let isFirst = true;
-        for (const key of keys) {
-          if (texts[key] && texts[key].text.trim()) {
-            const { text, speaker, index } = texts[key];
-            
-            // Build display message (full transcript for UI)
-            if (speaker !== lastSpeaker && !isFirst) {
-              displayMsg += '\n';
-            }
-            if (isFirst || speaker !== lastSpeaker) {
-              displayMsg += speaker === 'none' 
-                ? ` ${text}`
-                : ` <strong>${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}:</strong> ${text}`;
-            } else {
-              displayMsg += ` ${text}`;
-            }
-            
-            // Only add to new message if it's new content and non-empty
-            if (index > lastProcessedIndex.current && 
-                transcript.message_type === 'FinalTranscript' && 
-                text.trim()) {
-              // Only add speaker label if it's a new speaker or first message
-              const speakerPrefix = speaker === 'none' ? '' : 
-                `${speaker === 'sales_rep' ? 'Sales Rep' : 'Customer'}: `;
-              newMsg = speakerPrefix + text;  // Replace instead of append
-              lastProcessedIndex.current = index;
-            }
-            
-            lastSpeaker = speaker;
-            isFirst = false;
-          }
-        }
-        
-        setTranscript(displayMsg);
-        
-        // Only update accumulating transcript if we have new content
-        if (newMsg.trim()) {
-          setCurrentAccumulatingTranscript(newMsg);
-        }
-      });
-
-      realtimeTranscriber.current.on('error', event => {
-        console.error(event);
-        realtimeTranscriber.current.close();
-        realtimeTranscriber.current = null;
-      });
-
-      realtimeTranscriber.current.on('close', (code, reason) => {
-        console.log(`Connection closed: ${code} ${reason}`);
-        realtimeTranscriber.current = null;
-      });
-
-      await realtimeTranscriber.current.connect();
-    }
-  };
-
-  // Modify the processTranscriptUpdate function to clear the current transcript before processing
-const processTranscriptUpdate = useCallback(async (newTranscript) => {
-  if (!newTranscript.trim()) return;
-  
-  // Store the current transcript and clear it immediately to prevent duplicate processing
-  const transcriptToProcess = newTranscript;
-  setCurrentAccumulatingTranscript('');
-  const labeledTranscript = transcriptToProcess
-  
-  setIsLLMProcessing(true);
-  try {
-    const response = await fetch('http://localhost:8000/process-transcript', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        transcript: labeledTranscript,
-        conversationId,
-        callContext
-      })
-    });
-
-    const updates = await response.json();
-    
-    if (updates.update_summary) {
-      setSummaryPoints(prev => [...prev, updates.update_summary.new_point]);
-    }
-    if (updates.update_bant) {
-      setBANT(prev => ({
-        ...prev,
-        ...updates.update_bant
-      }));
-    }
-    if (updates.update_company_info) {
-      setCompanyInfo(updates.update_company_info.companyInfo);
-    }
-    if (updates.update_sales_reminders) {
-      setSalesReminders(prev => [...prev, updates.update_sales_reminders.new_reminder]);
-    }
-    if (updates.update_objections && updates.update_objections.new_objection) {
-      let objectionText;
-      if (typeof updates.update_objections.new_objection === 'string') {
-        // Extract the objection text from the parameter tag
-        const match = updates.update_objections.new_objection.match(/<parameter name="objection">(.*)/);
-        objectionText = match ? match[1] : updates.update_objections.new_objection;
-      } else {
-        objectionText = updates.update_objections.new_objection.objection;
-      }
-    
-      const newObjection = {
-        objection: objectionText,
-        handling_strategy: updates.update_objections.handling_strategy
-      };
-      
-      setObjections(prev => [...prev, newObjection]);
-    }
-
-    startProcessingTimer();
-  } catch (error) {
-    console.error('Error processing transcript:', error);
-  } finally {
-    setIsLLMProcessing(false);
-  }
-}, [conversationId, callContext, startProcessingTimer, currentSpeaker]);
-
-  useEffect(() => {
-    if (!isTranscriptionStopped && !isLLMProcessing && currentAccumulatingTranscript.trim()) {
-      processTranscriptUpdate(currentAccumulatingTranscript);
-    }
-  }, [isLLMProcessing, currentAccumulatingTranscript, processTranscriptUpdate, isTranscriptionStopped]);
-
-const handleFileUpload = (event) => {
+  const handleFileUpload = (event) => {
     const file = event.target.files[0];
     setAudioFile(file);
     if (audioPlayer.current) {

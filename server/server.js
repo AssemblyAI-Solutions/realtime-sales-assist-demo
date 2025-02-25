@@ -202,26 +202,34 @@ app.post('/process-transcript', async (req, res) => {
   }
 
   try {
-    // Initial message from user
-    const userMessage = {
-      role: "user",
-      content: `New conversation segment: ${transcript}`
-    };
+    // Only add messages that have content
+    if (transcript.trim()) {
+      const userMessage = {
+        role: "user",
+        content: `New conversation segment: ${transcript}`
+      };
+      conversationHistory.push(userMessage);
+    }
 
-    // Add user message to conversation history first
-    conversationHistory.push(userMessage);
+    // Filter out any messages with empty content before sending to Claude
+    const validHistory = conversationHistory.filter(msg => {
+      if (Array.isArray(msg.content)) {
+        return msg.content.length > 0;
+      }
+      return msg.content && msg.content.trim().length > 0;
+    });
 
     console.log('\n=== Making Initial Claude Request ===');
     console.log('System Prompt:', getSystemPrompt(callContext));
     console.log('Tools Configuration:', JSON.stringify(TOOLS, null, 2));
-    console.log('User Message:', JSON.stringify(userMessage, null, 2));
+    console.log('Valid History:', JSON.stringify(validHistory, null, 2));
 
     let message = await anthropic.messages.create({
       model: "claude-3-7-sonnet-latest",
       max_tokens: 1024,
       system: getSystemPrompt(callContext),
       tools: TOOLS,
-      messages: conversationHistory
+      messages: validHistory
     });
 
     console.log('\n=== Initial Claude Response ===');
@@ -248,23 +256,33 @@ app.post('/process-transcript', async (req, res) => {
       }
 
       console.log('\n=== Updating Conversation History ===');
-      // Add the assistant's tool use message and the user's tool result message to history
-      const assistantMessage = {
-        role: "assistant",
-        content: message.content
-      };
-      const toolResultMessage = {
-        role: "user",
-        content: toolResults
-      };
+      // Only add messages if they have content
+      if (message.content && message.content.length > 0) {
+        const assistantMessage = {
+          role: "assistant",
+          content: message.content
+        };
+        conversationHistory.push(assistantMessage);
+      }
 
-      console.log('Adding Assistant Message:', JSON.stringify(assistantMessage, null, 2));
-      console.log('Adding Tool Result Message:', JSON.stringify(toolResultMessage, null, 2));
-      
-      conversationHistory.push(assistantMessage, toolResultMessage);
+      if (toolResults.length > 0) {
+        const toolResultMessage = {
+          role: "user",
+          content: toolResults
+        };
+        conversationHistory.push(toolResultMessage);
+      }
+
+      // Filter history again before making next request
+      const validHistory = conversationHistory.filter(msg => {
+        if (Array.isArray(msg.content)) {
+          return msg.content.length > 0;
+        }
+        return msg.content && msg.content.trim().length > 0;
+      });
 
       console.log('\n=== Making Follow-up Claude Request ===');
-      console.log('Conversation History:', JSON.stringify(conversationHistory, null, 2));
+      console.log('Valid History:', JSON.stringify(validHistory, null, 2));
       
       // Get next message from Claude
       message = await anthropic.messages.create({
@@ -272,7 +290,7 @@ app.post('/process-transcript', async (req, res) => {
         max_tokens: 1024,
         system: getSystemPrompt(callContext),
         tools: TOOLS,
-        messages: conversationHistory
+        messages: validHistory
       });
 
       console.log('\n=== Follow-up Claude Response ===');
@@ -280,8 +298,8 @@ app.post('/process-transcript', async (req, res) => {
       console.log('Response Content:', JSON.stringify(message.content, null, 2));
     }
 
-    // Add final message to history if it's not a tool use
-    if (message.stop_reason !== 'tool_use') {
+    // Add final message to history if it has content
+    if (message.stop_reason !== 'tool_use' && message.content && message.content.length > 0) {
       const finalMessage = {
         role: "assistant",
         content: message.content
